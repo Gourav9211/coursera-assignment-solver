@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Local dev / tooling (not part of the extension)
+test.js
+.agents/
+skills-lock.json
+
+# Node (if tooling is added later)
+node_modules/
+
+# Build artifacts
+*.crx
+*.pem
+dist/

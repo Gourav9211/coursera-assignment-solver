@@ -1,0 +1,431 @@
+let capturedUserId = null;
+let capturedCourseId = null;
+let capturedAuthToken = null;
+
+// Listen for messages from the natively injected intercept script
+window.addEventListener("message", (event) => {
+    // We only accept messages from ourselves
+    if (event.source !== window || !event.data || event.data.source !== "coursera-assignment-solver-interceptor") {
+        return;
+    }
+
+    const { url, contentType, response, request } = event.data;
+
+    if (response && response.context && response.context.dispatcher) {
+        try {
+            capturedUserId = response.context.dispatcher.stores.ApplicationStore.userData.id;
+        } catch (e) { }
+    }
+
+    if (!capturedUserId && request && request.url) {
+        const userMatch = request.url.match(/user\/([0-9]+)/) || request.url.match(/userId=([0-9]+)/);
+        if (userMatch) {
+            capturedUserId = userMatch[1];
+            console.log("Got User ID from intercepted URL:", capturedUserId);
+        }
+    }
+
+    if (request && request.headers && request.headers.length > 0) {
+        request.headers.forEach(header => {
+            if (header[0].toLowerCase() === 'x-csrf3-token') {
+                capturedAuthToken = header[1];
+            }
+        });
+    }
+
+    if (request && request.url && (request.url.includes("api/onDemandCourses.v1") || request.url.includes("slug="))) {
+        const urlParams = new URL(request.url).searchParams;
+        if (urlParams.has("slug")) {
+            capturedCourseId = urlParams.get("slug");
+            console.log("Got Course ID from API:", capturedCourseId);
+        }
+    }
+});
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "solveQuizDirectly") {
+        sendResponse({ status: "started" });
+        showOrUpdateBanner("Extracting questions and contacting AI... 🤖", "info");
+
+        const arrayQuestions = scrapeAssessment();
+
+        if (!arrayQuestions || arrayQuestions.length === 0) {
+            showOrUpdateBanner("No questions found on this page! Are you on a quiz?", "error");
+            setTimeout(hideBanner, 4000);
+            return;
+        }
+
+        console.log("Sending to AI background script...", arrayQuestions);
+
+        // Content script bypasses popup and talks directly to the stable background script
+        chrome.runtime.sendMessage(
+            { action: "fetchAIExplanation", text: arrayQuestions },
+            (aiResponse) => {
+                if (aiResponse && aiResponse.error) {
+                    showOrUpdateBanner("Error: " + aiResponse.error, "error");
+                    setTimeout(hideBanner, 5000);
+                } else if (aiResponse && aiResponse.result) {
+                    applyAnswersToDOM(aiResponse.result);
+                    showOrUpdateBanner("Answers applied successfully! ✅", "success");
+                    setTimeout(hideBanner, 4000);
+                } else {
+                    showOrUpdateBanner("An unknown error occurred.", "error");
+                    setTimeout(hideBanner, 4000);
+                }
+            }
+        );
+    }
+    if (request.action === "getSelection") {
+        const arrayQuestions = scrapeAssessment();
+        console.log(arrayQuestions);
+
+        // Send it back to the popup
+        sendResponse({ data: arrayQuestions });
+    }
+    if (request.action === "applyAIResponse") {
+        const aiAnswers = request.data;
+        console.log("AI Answers received in content.js:", aiAnswers);
+        applyAnswersToDOM(aiAnswers);
+    }
+    if (request.action === "completeVideos") {
+        if (!capturedCourseId) {
+            const matchUrl = window.location.pathname.match(/\/learn\/([^/]+)/);
+            if (matchUrl) {
+                capturedCourseId = matchUrl[1];
+                console.log("Got Course ID directly from URL Bar:", capturedCourseId);
+            }
+        }
+
+        if (!capturedAuthToken) {
+            sendResponse({ error: "Missing Auth Token! Please click around the course (e.g., refresh or open a new video) to grab background security tokens." });
+            return true;
+        }
+        if (!capturedCourseId) {
+            sendResponse({ error: "Missing Course ID! Please go to the main course page to grab your Course ID." });
+            return true;
+        }
+
+        sendResponse({ status: "started" });
+        startCompletionLoop();
+    }
+    // Return true to indicate we will send a response asynchronously
+    return true;
+});
+function scrapeAssessment() {
+    const scrapedAssessment = [];
+
+    // Select all the main container blocks for the questions
+    const questionBlocks = document.querySelectorAll('.css-1erl2aq, .css-12u8wr5, [data-testid="part-Submission_RichTextQuestion"]');
+    console.log(questionBlocks);
+
+    questionBlocks.forEach((block, index) => {
+        // 1. Extract the Question Text
+        // Practice quizzes use id^="prompt-autoGradableResponseId", Graded quizzes use id^="prompt-"
+        const promptNode = block.querySelector('[id^="prompt-"] [data-testid="cml-viewer"]');
+
+        // Skip if it doesn't match our expected structure
+        if (!promptNode) return;
+
+        const questionText = promptNode.innerText.trim();
+
+        // 2. Extract the Options and Question Type
+        const options = [];
+        let questionType = 'unknown';
+
+        // Find all option wrappers within this specific question block
+        const optionNodes = block.querySelectorAll('.rc-Option');
+
+        // Check if it has multiple choice/checkbox options
+        if (optionNodes.length > 0) {
+            optionNodes.forEach(opt => {
+                const textNode = opt.querySelector('[data-testid="cml-viewer"]');
+                const inputNode = opt.querySelector('input');
+
+                if (textNode && inputNode) {
+                    // Push the clean text of the option
+                    options.push(textNode.innerText.trim());
+
+                    // Determine the question type based on the input attribute
+                    if (questionType === 'unknown') {
+                        questionType = inputNode.type === 'radio' ? 'single_answer' : 'multiple_answer';
+                    }
+                }
+            });
+        } else {
+            // 3. Fallback for Text Input Questions
+            // Look for a standard text input, an input with no type defined, or a textarea/slate-editor
+            const standardInput = block.querySelector('input[type="text"], input:not([type="radio"]):not([type="checkbox"]), textarea');
+            const slateEditor = block.querySelector('[data-slate-editor="true"]');
+
+            if (slateEditor) {
+                questionType = 'essay';
+            } else if (standardInput) {
+                questionType = 'text_input';
+            }
+        }
+
+        // 4. Construct the object and add it to our main array
+        scrapedAssessment.push({
+            questionNumber: index + 1,
+            type: questionType,
+            question: questionText,
+            options: options
+        });
+    });
+
+    return scrapedAssessment;
+}
+function applyAnswersToDOM(correctAnswers) {
+    // Select all the main container blocks for the questions
+    const questionBlocks = document.querySelectorAll('.css-1erl2aq, .css-12u8wr5, [data-testid="part-Submission_RichTextQuestion"]');
+
+    questionBlocks.forEach((block, index) => {
+        const currentQuestionNumber = index + 1;
+
+        // Find the matching answer data from our JSON for this specific question
+        const answerData = correctAnswers.find(q => q.questionNumber === currentQuestionNumber);
+
+        // If we don't have an answer for this question, or the array is empty, skip it
+        if (!answerData || !answerData.correctOptions || answerData.correctOptions.length === 0) return;
+
+        // Check if there are option wrappers (multiple choice / checkbox)
+        const optionNodes = block.querySelectorAll('.rc-Option');
+
+        if (optionNodes.length > 0) {
+            // --- HANDLE MULTIPLE CHOICE & CHECKBOXES ---
+            optionNodes.forEach(opt => {
+                const textNode = opt.querySelector('[data-testid="cml-viewer"]');
+                const inputNode = opt.querySelector('input');
+
+                if (textNode && inputNode) {
+                    const optionText = textNode.innerText.trim();
+                    const shouldBeSelected = answerData.correctOptions.includes(optionText);
+
+                    if (shouldBeSelected && !inputNode.checked) {
+                        // It's a correct answer but currently unchecked -> Click it
+                        inputNode.click();
+                    } else if (!shouldBeSelected && inputNode.checked && inputNode.type === 'checkbox') {
+                        // It's an incorrect answer but currently checked -> Unclick it
+                        inputNode.click();
+                    }
+                }
+            });
+        } else {
+            // --- HANDLE TEXT INPUTS ---
+            // Look for a standard text input, an input with no type defined, or a textarea/slate-editor
+            const textInputNode = block.querySelector('input[type="text"], input:not([type="radio"]):not([type="checkbox"]), textarea, [data-slate-editor="true"]');
+
+            if (textInputNode) {
+                // Grab the generated text string from our JSON
+                const textToType = answerData.correctOptions[0];
+
+                if (textInputNode.hasAttribute('contenteditable')) {
+                    // Handle Slate Editor / ContentEditable
+                    textInputNode.focus();
+
+                    // We must wait a tiny bit for the editor to focus properly before typing
+                    setTimeout(() => {
+                        // Select all placeholder text and replace it with our AI answer
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, textToType);
+                    }, 50);
+                } else {
+                    // 1. Set the raw value for standard inputs
+                    textInputNode.value = textToType;
+
+                    // 2. Dispatch events so the React application registers the state change
+                    textInputNode.dispatchEvent(new Event('input', { bubbles: true }));
+                    textInputNode.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }
+        }
+    });
+
+    console.log("Answers applied successfully!");
+}
+
+// Helper UI Functions for the Banner
+function showOrUpdateBanner(text, type = "info") {
+    let banner = document.getElementById("coursera-assignment-solver-banner");
+    if (!banner) {
+        banner = document.createElement("div");
+        banner.id = "coursera-assignment-solver-banner";
+        banner.style.position = "fixed";
+        banner.style.bottom = "30px";
+        banner.style.left = "50%";
+        banner.style.transform = "translateX(-50%)";
+        banner.style.zIndex = "9999999";
+        banner.style.padding = "16px 32px";
+        banner.style.color = "white";
+        banner.style.fontWeight = "bold";
+        banner.style.borderRadius = "50px";
+        banner.style.boxShadow = "0 10px 25px rgba(0,0,0,0.5)";
+        banner.style.fontFamily = "ui-sans-serif, system-ui, -apple-system, sans-serif";
+        banner.style.fontSize = "16px";
+        banner.style.transition = "opacity 0.3s ease";
+        document.body.appendChild(banner);
+    }
+
+    if (type === "success") {
+        banner.style.backgroundColor = "#16a34a";
+        banner.innerHTML = "✅ " + text;
+    } else if (type === "error") {
+        banner.style.backgroundColor = "#ef4444";
+        banner.innerHTML = "❌ " + text;
+    } else {
+        banner.style.backgroundColor = "#2563eb";
+        banner.innerHTML = `<span style="display:inline-block; margin-right:8px; animation: spin 1s linear infinite;">⏳</span> ` + text;
+
+        // Inject a quick keyframe style if it doesn't exist for the spinner
+        if (!document.getElementById("coursera-assignment-solver-styles")) {
+            const style = document.createElement("style");
+            style.id = "coursera-assignment-solver-styles";
+            style.innerHTML = `@keyframes spin { 100% { transform: rotate(360deg); } }`;
+            document.head.appendChild(style);
+        }
+    }
+}
+
+function hideBanner() {
+    const banner = document.getElementById("coursera-assignment-solver-banner");
+    if (banner) {
+        banner.style.opacity = "0";
+        setTimeout(() => banner.remove(), 300);
+    }
+}
+
+async function startCompletionLoop() {
+    console.log("Starting Auto-Completion for course: ", capturedCourseId);
+    showOrUpdateBanner("Gathering course data...", "info");
+
+    try {
+        // STEP A: Fetch the course modules using the full includes string (now including contentSummary for exact types)
+        const courseDataurl = `https://www.coursera.org/api/onDemandCourseMaterials.v2/?q=slug&slug=${capturedCourseId}&includes=modules,lessons,items&fields=moduleIds,onDemandCourseMaterialModules.v1(lessonIds,optional),onDemandCourseMaterialLessons.v1(elementIds,optional,itemIds),onDemandCourseMaterialItems.v2(name,isLocked,itemClass,contentSummary)`;
+        const courseDataResponse = await fetch(courseDataurl, {
+            headers: {
+                "X-CSRF3-Token": capturedAuthToken
+            }
+        });
+
+        const courseData = await courseDataResponse.json();
+        // Extract the true internal course ID (e.g., 't_wxQwp9...') from the first element
+        let internalCourseId = capturedCourseId;
+        if (courseData && courseData.elements && courseData.elements.length > 0 && courseData.elements[0].id) {
+            internalCourseId = courseData.elements[0].id;
+            console.log("Found Internal Course ID: " + internalCourseId);
+        }
+
+        const itemsToComplete = extractVideoAndReadingIds(courseData);
+
+        if (itemsToComplete.length === 0) {
+            showOrUpdateBanner("Could not find any videos/modules to complete.", "error");
+            alert("Could not find any videos/modules to complete. Did you load the correct page?");
+            setTimeout(hideBanner, 4000);
+            return;
+        }
+
+        console.log(`Found ${itemsToComplete.length} items to complete! Starting loop...`);
+
+        // STEP B: Complete items in parallel chunks to dramatically speed up the process while avoiding rate limits!
+        const CHUNK_SIZE = 6;
+        console.log(`Found ${itemsToComplete.length} items to complete! Starting loop in chunks of ${CHUNK_SIZE}...`);
+
+        for (let i = 0; i < itemsToComplete.length; i += CHUNK_SIZE) {
+            const chunk = itemsToComplete.slice(i, i + CHUNK_SIZE);
+            const chunkEnd = Math.min(i + CHUNK_SIZE, itemsToComplete.length);
+
+            showOrUpdateBanner(`Completing items ${i + 1} to ${chunkEnd} of ${itemsToComplete.length}... ⚡`);
+
+            const chunkPromises = chunk.map(async (itemObj, indexInChunk) => {
+                const itemId = itemObj.id;
+                const itemType = itemObj.type;
+                const absIndex = i + indexInChunk + 1;
+
+                console.log(`[${absIndex}/${itemsToComplete.length}] Faking completion for item: ${itemId} (Type: ${itemType})`);
+
+                try {
+                    const finalUserId = capturedUserId || "~";
+
+                    if (itemType === 'lecture' || itemType === 'unknown') {
+                        return fetch(`https://www.coursera.org/api/opencourse.v1/user/${finalUserId}/course/${capturedCourseId}/item/${itemId}/lecture/videoEvents/ended?autoEnroll=false`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json", "X-CSRF3-Token": capturedAuthToken },
+                            body: JSON.stringify({ "contentRequestBody": {} })
+                        });
+                    } else if (itemType === 'supplement') {
+                        if (internalCourseId) {
+                            return fetch(`https://www.coursera.org/api/onDemandSupplementCompletions.v1`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json", "X-CSRF3-Token": capturedAuthToken },
+                                body: JSON.stringify({ "userId": parseInt(finalUserId) || finalUserId, "courseId": internalCourseId, "itemId": itemId })
+                            });
+                        }
+                    } else {
+                        console.log(`[Skipping] Item ${itemId} has type '${itemType}' and does not need automation.`);
+                    }
+                } catch (e) {
+                    console.log(`[Error] Request failed for item ${itemId}`, e);
+                }
+            });
+
+            // Wait for all fetches in the current chunk to complete simultaneously
+            await Promise.all(chunkPromises);
+
+            // Tiny intentional delay between major chunks to preserve session health
+            await new Promise(r => setTimeout(r, 400));
+        }
+
+        showOrUpdateBanner("Course Automagically Completed! Please refresh the page.", "success");
+        alert("Course Automagically Completed! please refresh the page to see the changes.");
+        setTimeout(hideBanner, 6000);
+    } catch (err) {
+        console.error(err);
+        showOrUpdateBanner("An error occurred. Check browser console.", "error");
+        alert("An error occurred. Check browser console.");
+        setTimeout(hideBanner, 5000);
+    }
+}
+
+// Helper: extracts the specific video/module ID's from Coursera's API response
+function extractVideoAndReadingIds(jsonMap) {
+    let ids = [];
+
+    // When using 'includes=items', Coursera provides all items flatly in the 'linked' dictionary!
+    if (jsonMap && jsonMap.linked && jsonMap.linked['onDemandCourseMaterialItems.v2']) {
+        const items = jsonMap.linked['onDemandCourseMaterialItems.v2'];
+        items.forEach(item => {
+            // Extract the exact type using the newly added contentSummary, or fallback to itemClass
+            const exactType = (item.contentSummary && item.contentSummary.typeName) ? item.contentSummary.typeName : (item.itemClass || 'unknown');
+
+            // Determine if this item is an assignment/quiz/widget that we should NOT automate
+            // Types directly from your provided JSON!
+            const isQuizClass = ['quiz', 'exam', 'programming', 'phasedPeer', 'peer', 'ungradedAssignment', 'staffGraded', 'ungradedWidget'].includes(exactType);
+
+            // Fallback to name checking just in case
+            const isQuizName = item.name && (item.name.toLowerCase().includes('quiz') || item.name.toLowerCase().includes('challenge'));
+
+            if (item && item.id && !isQuizClass && !isQuizName) {
+                // Push BOTH the ID and the exact Type so the completion loop knows what to do!
+                ids.push({ id: item.id, type: exactType });
+            } else if (item && item.id) {
+                console.log(`[Filtered out assignment/quiz]: ${item.name} (${exactType})`);
+            }
+        });
+        return ids;
+    }
+
+    // Fallback for older V1 formats just in case
+    if (jsonMap && jsonMap.elements && jsonMap.elements[0] && jsonMap.elements[0].modules) {
+        jsonMap.elements[0].modules.forEach(module => {
+            if (module.lessons) {
+                module.lessons.forEach(lesson => {
+                    if (lesson.itemIds) {
+                        lesson.itemIds.forEach(itemId => ids.push({ id: itemId, type: 'unknown' }));
+                    }
+                });
+            }
+        });
+    }
+
+    return ids;
+}
