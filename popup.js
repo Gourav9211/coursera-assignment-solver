@@ -1,13 +1,17 @@
-chrome.storage.local.get(["userApiKey"], (result) => {
+chrome.storage.local.get(["userApiKey", "geminiModel"], (result) => {
   if (result.userApiKey) {
     document.getElementById("apiKeyInput").value = result.userApiKey;
+  }
+  if (result.geminiModel) {
+    document.getElementById("modelInput").value = result.geminiModel;
   }
 });
 document.getElementById("saveBtn").addEventListener("click", () => {
   const key = document.getElementById("apiKeyInput").value.trim();
-  chrome.storage.local.set({ userApiKey: key }, () => {
+  const model = document.getElementById("modelInput").value.trim();
+  chrome.storage.local.set({ userApiKey: key, geminiModel: model }, () => {
     const status = document.getElementById("status");
-    status.innerText = "Key saved successfully!";
+    status.innerText = "Settings saved successfully!";
     setTimeout(() => (status.innerText = ""), 2000);
   });
 });

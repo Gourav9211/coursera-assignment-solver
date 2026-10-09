@@ -8,16 +8,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 });
+const DEFAULT_MODEL = "gemini-3-flash-preview";
+
 async function getAIResponse(questionsArray) {
-  const storageData = await chrome.storage.local.get(["userApiKey"]);
+  const storageData = await chrome.storage.local.get(["userApiKey", "geminiModel"]);
   const API_KEY = storageData.userApiKey;
+  const MODEL = (storageData.geminiModel && storageData.geminiModel.trim()) || DEFAULT_MODEL;
 
   if (!API_KEY) {
     console.error("Error: Please save your API key in the extension first!");
     return null;
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`;
 
   // Stringify the incoming questions array so the AI can read it
   const questionsJsonString = JSON.stringify(questionsArray, null, 2);

@@ -45,6 +45,13 @@ A sleek, lightweight Chrome Extension (Manifest V3) that helps you navigate and 
 * **Permissions:** `activeTab`, `scripting`, `storage`, plus a host permission scoped to Coursera only.
 * No analytics, no tracking, no third-party servers.
 
+## 🆕 Changelog
+
+**v1.1.0**
+- ⚙️ **Configurable Gemini model:** pick any model in the popup (default remains `gemini-3-flash-preview`).
+- 🔧 **Fixed XHR token capture:** the interceptor now records headers set via `setRequestHeader`, so CSRF tokens are captured on XHR requests too (previously only `fetch` was captured reliably).
+- 🛎️ **No more intrusive popups:** replaced browser `alert()` dialogs with the in-page status banner.
+
 ## 🗂️ Project Structure
 
 | File | Purpose |

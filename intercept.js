@@ -3,6 +3,7 @@
     const originalFetch = window.fetch;
     const originalXHROpen = XMLHttpRequest.prototype.open;
     const originalXHRSend = XMLHttpRequest.prototype.send;
+    const originalXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
     // 2. Setup the bridge to talk to content.js
     class InterceptBus {
@@ -82,7 +83,7 @@
             const requestData = {
                 url: url,
                 method: this._interceptMethod,
-                headers: this._interceptHeaders, 
+                headers: this._interceptHeaders || {}, 
                 body: body,
                 status: this.status,
                 statusText: this.statusText
@@ -92,6 +93,16 @@
         });
 
         return originalXHRSend.apply(this, arguments);
+    };
+
+    // Record headers set via setRequestHeader so we can capture auth tokens
+    // (e.g. x-csrf3-token) on XHR requests too, not just fetch.
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        if (!this._interceptHeaders) {
+            this._interceptHeaders = {};
+        }
+        this._interceptHeaders[name] = value;
+        return originalXHRSetRequestHeader.apply(this, arguments);
     };
     
     // Add an alert so we visually know this script injected properly during testing

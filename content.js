@@ -25,12 +25,16 @@ window.addEventListener("message", (event) => {
         }
     }
 
-    if (request && request.headers && request.headers.length > 0) {
-        request.headers.forEach(header => {
-            if (header[0].toLowerCase() === 'x-csrf3-token') {
-                capturedAuthToken = header[1];
+    if (request && request.headers) {
+        // fetch headers arrive as [[name, value], ...]; XHR headers as {name: value}
+        const rawHeaders = request.headers;
+        const headerPairs = Array.isArray(rawHeaders) ? rawHeaders : Object.entries(rawHeaders);
+        for (const [name, value] of headerPairs) {
+            if (String(name).toLowerCase() === 'x-csrf3-token' && value) {
+                capturedAuthToken = value;
+                break;
             }
-        });
+        }
     }
 
     if (request && request.url && (request.url.includes("api/onDemandCourses.v1") || request.url.includes("slug="))) {
@@ -319,7 +323,6 @@ async function startCompletionLoop() {
 
         if (itemsToComplete.length === 0) {
             showOrUpdateBanner("Could not find any videos/modules to complete.", "error");
-            alert("Could not find any videos/modules to complete. Did you load the correct page?");
             setTimeout(hideBanner, 4000);
             return;
         }
@@ -376,12 +379,10 @@ async function startCompletionLoop() {
         }
 
         showOrUpdateBanner("Course Automagically Completed! Please refresh the page.", "success");
-        alert("Course Automagically Completed! please refresh the page to see the changes.");
         setTimeout(hideBanner, 6000);
     } catch (err) {
         console.error(err);
         showOrUpdateBanner("An error occurred. Check browser console.", "error");
-        alert("An error occurred. Check browser console.");
         setTimeout(hideBanner, 5000);
     }
 }
